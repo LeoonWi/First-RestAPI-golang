@@ -1,15 +1,19 @@
 package main
 
 import (
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
-	"sync"
 
 	"github.com/labstack/echo/v4"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 type Message struct {
-	Text string `json:"text"`
+	Id   uint   `gorm:"primaryKey" json:"id"`
+	Text string `gorm:"type:text" json:"text"`
 }
 
 type Response struct {
@@ -17,13 +21,29 @@ type Response struct {
 	Message string `json:"message"`
 }
 
-var (
-	messages     = make(map[int]string)
-	index    int = 0
-	mu       sync.Mutex
-)
+var db *gorm.DB
+
+func initDB() {
+	dsn := "host=localhost user=postgres password=admin dbname=mydb port=5432 sslmode=disable"
+	var err error
+	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("Не удалось подключиться к базе данных: %v", err)
+	}
+
+	db.AutoMigrate(&Message{})
+}
 
 func getMessage(c echo.Context) error {
+	var messages []Message
+
+	if err := db.Find(&messages).Error; err != nil {
+		return c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: fmt.Sprintf("Failed to receive messages: %v", err),
+		})
+	}
+
 	return c.JSON(http.StatusOK, &messages)
 }
 
@@ -43,8 +63,12 @@ func postMessage(c echo.Context) error {
 		})
 	}
 
-	index++
-	messages[index] = message.Text
+	if err := db.Create(&message).Error; err != nil {
+		return c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: "Could not create the message",
+		})
+	}
 
 	return c.JSON(http.StatusOK, Response{
 		Status:  "Done",
@@ -65,18 +89,6 @@ func patchMessage(c echo.Context) error {
 		})
 	}
 
-	// блокировка Mutex необходима для корректной работы с картами
-	// горутины могут начать date race
-	mu.Lock()
-	_, k := messages[id] // value, key := message[id] - value может быть "", key будет True или False
-	mu.Unlock()
-	if !k {
-		return c.JSON(http.StatusBadRequest, Response{
-			Status:  "Error",
-			Message: "Unknown ID",
-		})
-	}
-
 	var message Message
 	if err := c.Bind(&message); err != nil {
 		return c.JSON(http.StatusBadRequest, Response{
@@ -92,7 +104,13 @@ func patchMessage(c echo.Context) error {
 		})
 	}
 
-	messages[id] = message.Text
+	if err := db.Model(&message).Where("id = ?", id).Update("text", message.Text).Error; err != nil {
+		return c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: fmt.Sprintf("Could not update the message: %v", err),
+		})
+	}
+
 	return c.JSON(http.StatusOK, Response{
 		Status:  "Done",
 		Message: "Message has been updated",
@@ -110,17 +128,13 @@ func deleteMessage(c echo.Context) error {
 		})
 	}
 
-	mu.Lock()
-	_, k := messages[id]
-	mu.Unlock()
-	if !k {
+	if err := db.Delete(&Message{}, id).Error; err != nil {
 		return c.JSON(http.StatusBadRequest, Response{
 			Status:  "Error",
-			Message: "Unknown ID",
+			Message: fmt.Sprintf("Could not delete the message: %v", err),
 		})
 	}
 
-	delete(messages, id)
 	return c.JSON(http.StatusOK, Response{
 		Status:  "Done",
 		Message: "Message has been deleted",
@@ -128,10 +142,13 @@ func deleteMessage(c echo.Context) error {
 }
 
 func main() {
+	initDB()
+
 	e := echo.New()
 	e.GET("/", getMessage)
 	e.POST("/", postMessage)
 	e.PATCH("/:id", patchMessage)
 	e.DELETE("/:id", deleteMessage)
+
 	e.Start(":8080")
 }
